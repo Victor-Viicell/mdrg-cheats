@@ -355,19 +355,27 @@ def find_key_bails(elf: Elf, sites: dict[int, list[int]], getter: int) -> set[in
 
 
 def branch_after(elf: Elf, site: int) -> tuple[int, int] | None:
-    """The (kind, target) of the conditional branch right after a bool call:
-    kind 0 = je (taken when the answer is true), 1 = jne."""
+    """The conditional branch right after a bool call -> (kind, target).
+
+    `test al,al` sets ZF from the result, so `je` fires when the answer is
+    FALSE and `jne` when it is TRUE:
+
+        kind 0 = je  : taken when the answer is false
+        kind 1 = jne : taken when the answer is true
+    """
     after = elf.at(site + 5, 8)
     if len(after) < 4 or after[:2] != b"\x84\xc0":          # test al,al
         return None
     j = 2
-    if 0x70 <= after[j] <= 0x7F:
+    if after[j] == 0x74:
         target = site + 5 + j + 2 + struct.unpack_from("<b", after, j + 1)[0]
-        taken_true = after[j] in (0x74, 0x75)
-        return (0 if after[j] == 0x74 else 1, target) if taken_true else None
-    if after[j] == 0x0F and 0x80 <= after[j + 1] <= 0x8F:
+        return 0, target
+    if after[j] == 0x75:
+        target = site + 5 + j + 2 + struct.unpack_from("<b", after, j + 1)[0]
+        return 1, target
+    if after[j] == 0x0F and after[j + 1] in (0x84, 0x85):
         target = site + 5 + j + 6 + struct.unpack_from("<i", after, j + 2)[0]
-        return (0 if after[j + 1] == 0x84 else 1, target)
+        return (0 if after[j + 1] == 0x84 else 1), target
     return None
 
 
@@ -376,14 +384,16 @@ FALSE5 = b"\x31\xc0\x90\x90\x90"         # xor eax,eax + nops
 
 
 def find_marker_checks(elf: Elf, sites: dict[int, list[int]], getter: int, bails: set[int]) -> list[tuple[int, bytes]]:
-    """Every marker verdict the cheat handlers run on the stored key, with the
-    value that makes it answer "this key is valid".
+    """Every stored-key verdict the cheat handlers run, answered so the handler
+    carries on towards its menu.
 
     Shape: the key was just read, then `mov rsi,rax` passes a freshly built
-    (decrypted) marker/expected code and the call's boolean result is branched
-    on. Two flavours appear - a prefix test (valid when true) and an equality
-    test against the expected code (valid when false) - so the forced value is
-    derived from the branch that leads to the handler's give-up label.
+    (decrypted) marker/code literal and the call's boolean result is branched on
+    right after. Each flavour wants its own answer - a prefix test wants true,
+    an equality test against the expected code wants false - and which one it is
+    follows from the branch: a branch to the handler's give-up label must be
+    avoided, a branch anywhere else is the path that builds the menu and must be
+    taken.  (`test al,al` + `je` = "taken when false", `jne` = "when true".)
     """
     hits: list[tuple[int, bytes]] = []
     for site in sites.get(getter, []):
@@ -398,13 +408,11 @@ def find_marker_checks(elf: Elf, sites: dict[int, list[int]], getter: int, bails
             if branch is None:
                 continue
             kind, target = branch
-            # kind 0 == je (taken when true), 1 == jne (taken when false)
-            to_bail = target in bails
-            if to_bail:
-                valid_true = kind == 1        # the branch fires on the *wrong* answer
+            if target in bails:
+                want_true = kind == 0        # avoid the give-up branch
             else:
-                valid_true = kind == 0        # the branch itself is the success path
-            hits.append((call_site, TRUE5 if valid_true else FALSE5))
+                want_true = kind == 1        # take the branch that continues
+            hits.append((call_site, TRUE5 if want_true else FALSE5))
     return sorted(set(hits))
 
 

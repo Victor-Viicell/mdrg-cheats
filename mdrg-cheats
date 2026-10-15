@@ -293,6 +293,64 @@ def find_code_gate(elf: Elf, gate: dict, sites: dict[int, list[int]], validator:
     }
 
 
+def find_code_getter(elf: Elf, gate: dict, validator: int) -> int | None:
+    """The "read the stored cheat key" call inside the tier function: its result
+    is moved into a register which then becomes the checker's first argument."""
+    body = elf.at(gate["tier_fn"], FN_WINDOW)
+    checker_at = None
+    for j in range(len(body) - 6):
+        if body[j] != 0xE8:
+            continue
+        rel = struct.unpack_from("<i", body, j + 1)[0]
+        if gate["tier_fn"] + j + 5 + rel == validator:
+            checker_at = j
+            break
+    if checker_at is None:
+        return None
+    # mov rX,rax sits right after a `call` that returned the stored key
+    for j in range(checker_at - 2, max(checker_at - 0x80, 0), -1):
+        if body[j] == 0x48 and body[j + 1] == 0x89 and 0xC0 <= body[j + 2] <= 0xC7:
+            for k in range(j - 5, max(j - 0x20, 0), -1):
+                if body[k] == 0xE8:
+                    rel = struct.unpack_from("<i", body, k + 1)[0]
+                    return gate["tier_fn"] + k + 5 + rel
+                if body[k] in (0xE8, 0xC3):
+                    break
+    return None
+
+
+def is_branch(code: bytes) -> bool:
+    return bool(code) and (
+        (code[0] == 0x0F and len(code) > 1 and 0x80 <= code[1] <= 0x8F)
+        or 0x70 <= code[0] <= 0x7F
+    )
+
+
+def find_marker_checks(elf: Elf, sites: dict[int, list[int]], getter: int) -> list[int]:
+    """Every marker verdict the cheat handlers run on the stored key.
+
+    Shape: the key was just read, then `mov rsi,rax` passes a freshly built
+    (decrypted) marker literal and the call's boolean result is branched on:
+
+        <read stored key> ... 48 89 c6  e8 .. .. .. ..  84 c0  75/0f 8x
+
+    Forcing these to true lets any stored key pass the handlers' marker test.
+    """
+    hits: list[int] = []
+    for site in sites.get(getter, []):
+        body = elf.at(site + 5, 0x140)
+        for j in range(len(body) - 6):
+            if body[j] != 0xE8:
+                continue
+            before = body[max(j - 0x10, 0):j]
+            if b"\x48\x89\xc6" not in before:                  # mov rsi,rax : the marker
+                continue
+            after = body[j + 5:j + 9]
+            if after[:2] == b"\x84\xc0" and is_branch(after[2:4]):   # test al,al; jcc
+                hits.append(site + 5 + j)
+    return sorted(set(hits))
+
+
 # ------------------------------------------------------------------- gate finding
 def find_gate_fresh(elf: Elf, index) -> dict | None:
     """Locate an *unpatched* gate: the callee shared by both boolean-wrapper shapes."""
@@ -397,6 +455,9 @@ def analyse(elf: Elf) -> dict | None:
     validator = find_validator(sites, gate)
     gate["validator"] = validator
     gate["code_gate"] = find_code_gate(elf, gate, sites, validator) if validator else None
+    getter = find_code_getter(elf, gate, validator) if validator else None
+    gate["code_getter"] = getter
+    gate["marker_checks"] = find_marker_checks(elf, sites, getter) if getter else []
     gate["patched"] = False
     gate["partially_patched"] = False
     return gate
@@ -412,9 +473,11 @@ def patch_state(live: Elf, gate: dict) -> dict:
     cheats popup offer "Disable Cheats" even when no key is stored).
     """
     key_gate = gate.get("code_gate")
+    checks = gate.get("marker_checks") or []
     key_ok = (
         live.at(key_gate["validator"], len(KEY_STUB)) == KEY_STUB
         and all(live.at(site, 6) == NOP6 for site in key_gate["guards"])
+        and all(live.at(site, 5) == FORCE_TRUE for site in checks)
         if key_gate
         else None
     )
@@ -454,6 +517,7 @@ NOP6 = b"\x90" * 6
 #   test rdi,rdi / je zero / cmp dword [rdi+0x10],0 / je zero / mov eax,20 / ret
 #   zero: xor eax,eax / ret
 KEY_STUB = bytes.fromhex("4885ff740c837f10007406b814000000c331c0c3")
+FORCE_TRUE = struct.pack("<BI", 0xB8, 1)   # mov eax,1 — same length as a `call rel32`
 
 
 def patch_mov_eax(value: int) -> bytes:
@@ -485,6 +549,8 @@ def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
         )
         for site in key_gate["guards"]:
             emit("cheat-key reject branch        (removed)", site, NOP6)
+        for site in gate.get("marker_checks") or []:
+            emit("cheat-key marker check          (forced true)", site, FORCE_TRUE)
         return log
 
     # no key gate found: fall back to pinning the tier and the wrappers
@@ -710,9 +776,13 @@ def main() -> int:
         print(f"tier     : caller compares {gate['compared']} -> advanced={gate['advanced']} debug={gate['debug_const']} (source: {gate['source']})")
         print(f"wrappers : DebugEnabled@{gate['debug_site']:#x}({gate['debug_len']})  AnyCheatsEnabled@{gate['any_site']:#x}({gate['any_len']})")
     cg = gate.get("code_gate")
+    checks = gate.get("marker_checks") or []
     if cg:
         print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = advanced); "
-              f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed")
+              f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed; "
+              f"{len(checks)} stored-key marker checks forced true")
+        if checks:
+            print(f"           marker checks at {checks[0]:#x} .. {checks[-1]:#x}")
     elif gate["source"] != "recovered":
         print("keygate  : !! not found - falling back to pinning the tier")
 
@@ -735,8 +805,8 @@ def main() -> int:
     elif stored_code:
         marked = stored_code.startswith(CHEAT_MARKER) and len(stored_code) >= 10
         print(f"key      : CKey = {stored_code!r}"
-              + ("" if marked else f"  !! the cheat handlers need a {CHEAT_MARKER!r} marker "
-                                   f"and 10+ chars - they bail on this value (run --set-key)"))
+              + ("" if marked else "  (no A~ marker - handled by the overridden marker checks; "
+                                   "--set-key writes one if you want the stored value canonical)"))
     else:
         print("key      : CKey empty -> the cheats popup will offer the key field")
 
@@ -777,6 +847,7 @@ def main() -> int:
             key_ok = (
                 check.at(cg["validator"], len(KEY_STUB)) == KEY_STUB
                 and all(check.at(site, 6) == NOP6 for site in cg["guards"])
+                and all(check.at(site, 5) == FORCE_TRUE for site in checks)
             )
             tier_clean = check.at(gate["tier_fn"], 6) != patch_mov_eax(gate["advanced"])
             wrappers_clean = check.at(gate["debug_site"], gate["debug_len"]) != patch_true(gate["debug_len"])

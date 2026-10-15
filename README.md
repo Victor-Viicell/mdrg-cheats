@@ -37,14 +37,20 @@ through the game's RSA-backed checker (`Sheep::CheckIfSheepIsHappy`) three times
 typed, twice with embedded self-test keys. The typed key must come back positive or the coroutine takes
 the reject branch and never stores it — which is why a hand-typed key never enables anything.
 
-The script locates that coroutine structurally too: the checker is the one function called once by the
-tier function and three times in a row by the enter-code path. It then neutralises exactly one 6-byte
-branch — the verdict on *your* key — so the store block is reached no matter what you typed. The two
-self-test keys, the RSA check and the tier/disable logic are left untouched, so the game's own
-enable/disable flow keeps working.
+Two patches fix that, both located structurally (the checker is the one function called once by the
+tier function and three times in a row by the enter-code path):
 
-`mdrg-cheats --status` also repairs the key slot: the stored key is written into the game's own
-PlayerPrefs (`<persistentDataPath>/Saves/PlayerPrefs.pp`), located via the game's `app.info`.
+1. **The checker itself** gets an entry stub: a non-empty key string returns the advanced tier,
+   an empty one returns 0. Typed keys are therefore accepted without the RSA payload having to be real.
+2. **The reject branches** of the enter-code coroutine are removed, so the store block is reached and
+   the key is written.
+
+The tier function is left untouched, so the game's own state machine still drives everything: no key =
+"cheats disabled" with the key field offered, any key = cheats on, *disable cheats* = off again.
+`mdrg-cheats --clear-key` clears a stored key if you want the field back.
+
+The key must still be 10+ characters starting with `A~` (advanced) because the cheat handlers test the
+stored value for that marker before they run — e.g. `A~1234567890`.
 
 ## Usage
 

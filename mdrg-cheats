@@ -403,8 +403,19 @@ def analyse(elf: Elf) -> dict | None:
 
 
 def patch_state(live: Elf, gate: dict) -> dict:
-    """Which of the three patches are already present in the installed library."""
-    tier_ok = live.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+    """Which patches are present in the installed library, and is it complete?
+
+    With the key gate patched the library must NOT carry the GetCheatTier pin:
+    a pinned tier makes the game report "cheats enabled" no matter what is
+    stored, which hides the key input in the cheats popup.
+    """
+    key_gate = gate.get("code_gate")
+    key_ok = (
+        live.at(key_gate["validator"], len(KEY_STUB)) == KEY_STUB
+        and all(live.at(site, 6) == NOP6 for site in key_gate["guards"])
+        if key_gate
+        else None
+    )
     tail_ok = (
         gate["debug_site"] is not None
         and live.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
@@ -413,23 +424,30 @@ def patch_state(live: Elf, gate: dict) -> dict:
         live.at(gate["debug_site"] - back, 6) == b"\xb8\x01\x00\x00\x00\xc3"
         for back in range(0, 0xA0)
     )
-    code_gate = gate.get("code_gate")
-    code_ok = (
-        all(live.at(site, 6) == NOP6 for site in (code_gate["verdict"],)) if code_gate else None
-    )
-    debug_ok = tail_ok or entry_ok
-    known = [tier_ok, debug_ok] + ([code_ok] if code_ok is not None else [])
+    wrappers_ok = tail_ok or entry_ok
+    tier_pinned = live.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+    stale_pin = bool(key_gate) and tier_pinned
+
+    complete = (key_ok is not False) and wrappers_ok and not stale_pin
     return {
-        "tier": tier_ok,
-        "debug": debug_ok,
-        "code": code_ok,
-        "patched": all(known),
-        "partially_patched": not all(known),
+        "key": key_ok,
+        "wrappers": wrappers_ok,
+        "tier_pinned": tier_pinned,
+        "stale_pin": stale_pin,
+        "patched": complete,
+        "partially_patched": not complete,
     }
 
 
 # ------------------------------------------------------------------- patch bytes
 NOP6 = b"\x90" * 6
+
+# Entry stub for the cheat-key checker: "any key you type is a valid advanced
+# key, an empty key means cheats off". 19 bytes; both paths return, so the
+# original prologue it overwrites is never needed.
+#   test rdi,rdi / je zero / cmp dword [rdi+0x10],0 / je zero / mov eax,20 / ret
+#   zero: xor eax,eax / ret
+KEY_STUB = bytes.fromhex("4885ff740c837f10007406b814000000c331c0c3")
 
 
 def patch_mov_eax(value: int) -> bytes:
@@ -441,6 +459,7 @@ def patch_true(region_len: int) -> bytes:
 
 
 def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
+    """Write the full patch set into `elf` (always called on pristine bytes)."""
     log = []
 
     def emit(label: str, addr: int, payload: bytes) -> None:
@@ -448,25 +467,27 @@ def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
         log.append(f"{label}  vaddr {addr:#x}  file offset {off:#x}  <- {payload.hex(' ')}")
         elf.write(addr, payload)
 
-    if not (state and state.get("tier")):
+    key_gate = gate.get("code_gate")
+    if key_gate:
+        # make the checker accept whatever key the player types, and drop the
+        # reject branches so the enter-code path stores it
+        emit(
+            f"cheat-key check                 (any key is advanced={gate['advanced']})",
+            key_gate["validator"],
+            KEY_STUB,
+        )
+        for site in key_gate["guards"]:
+            emit("cheat-key reject branch        (removed)", site, NOP6)
+    else:
+        # no key gate found: fall back to pinning the tier itself
         emit(
             f"GetCheatTier                   (returns advanced={gate['advanced']})",
             gate["tier_fn"],
             patch_mov_eax(gate["advanced"]),
         )
-    if not (state and state.get("debug")):
-        emit(f"DebugEnabled wrapper tail     (forced true)", gate["debug_site"], patch_true(gate["debug_len"]))
-        emit(f"AnyCheatsEnabled wrapper tail (forced true)", gate["any_site"], patch_true(gate["any_len"]))
 
-    code_gate = gate.get("code_gate")
-    if code_gate and not (state and state.get("code")):
-        emit(
-            "cheat-key verdict              (accepts the key you type in-game)",
-            code_gate["verdict"],
-            NOP6,
-        )
-    if not log:
-        log.append("nothing to patch - library already matches")
+    emit("DebugEnabled wrapper tail     (forced true)", gate["debug_site"], patch_true(gate["debug_len"]))
+    emit("AnyCheatsEnabled wrapper tail (forced true)", gate["any_site"], patch_true(gate["any_len"]))
     return log
 
 
@@ -537,7 +558,7 @@ def game_running(game_dir: Path) -> list[str]:
 
 # ------------------------------------------------------- in-game cheat code marker
 CHEAT_MARKER = "A~"                       # prefix every in-game cheat handler tests for
-CHEAT_CODE = CHEAT_MARKER + "0" * 16      # ... and the stored code must be >= 10 chars
+KEY_HINT = CHEAT_MARKER + "1234567890"    # what we tell the player to type (>=10 chars)
 
 
 def unity_data_dir(game_dir: Path) -> Path | None:
@@ -610,6 +631,7 @@ def main() -> int:
     ap.add_argument("--status", action="store_true", help="report state, change nothing")
     ap.add_argument("--dry-run", action="store_true", help="show patches, change nothing")
     ap.add_argument("--revert", action="store_true", help="restore the pristine library")
+    ap.add_argument("--clear-key", action="store_true", help="clear the stored cheat key so the game offers the key field")
     ap.add_argument("--force", action="store_true", help="proceed even if the game is running")
     args = ap.parse_args()
 
@@ -667,9 +689,6 @@ def main() -> int:
         return 1
     state = patch_state(live, gate)
     gate.update(state)
-    # patching pristine bytes always writes the full patch set; only skip
-    # already-applied patches when we are editing the installed library itself
-    skip = state if src_path == so_path else None
 
     off = elf.v2o(gate["tier_fn"])
     print(f"gate     : GetCheatTier @ vaddr {gate['tier_fn']:#x} (file offset {off:#x})")
@@ -680,38 +699,40 @@ def main() -> int:
         print(f"wrappers : DebugEnabled@{gate['debug_site']:#x}({gate['debug_len']})  AnyCheatsEnabled@{gate['any_site']:#x}({gate['any_len']})")
     cg = gate.get("code_gate")
     if cg:
-        print(f"codegate : key checker@{cg['validator']:#x}; enter-code path {cg['call_sites'][0]:#x}; "
-              f"verdict branch {cg['verdict']:#x} (rejects at {cg['reject']:#x} -> store {cg['accept']:#x})")
+        print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = advanced); "
+              f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed")
     elif gate["source"] != "recovered":
-        print("codegate : !! not found - entering a key in-game would still be rejected")
+        print("keygate  : !! not found - falling back to pinning the tier")
 
     if gate["patched"]:
-        print("\nlibrary  : ALREADY PATCHED (tier + wrappers + code gate).")
+        print("\nlibrary  : ALREADY PATCHED (key gate + wrappers).")
     else:
-        plan = apply_patch(elf, gate, skip)
+        plan = apply_patch(elf, gate)
+        if state.get("stale_pin"):
+            print("\ntier pin : removing the old GetCheatTier pin (it hid the key input)")
         print("\npatches:")
         for line in plan:
             print("  - " + line)
 
     stored_code = prefs_key_value(prefs, "CKey") if (prefs and prefs.is_file()) else None
-    code_ok = bool(stored_code) and stored_code.startswith(CHEAT_MARKER) and len(stored_code) >= 10
     if prefs is None:
-        print("code     : !! could not derive the game's PlayerPrefs path (app.info missing)")
-    elif code_ok:
-        print(f"code     : CKey {stored_code!r} (marker {CHEAT_MARKER!r} + >=10 chars) - ok")
+        print("key      : !! could not derive the game's PlayerPrefs path (app.info missing)")
+    elif stored_code:
+        print(f"key      : CKey = {stored_code!r} -> the game boots with cheats already on "
+              f"(press 'disable cheats' in-game, or pass --clear-key, to type your own)")
     else:
-        print(f"code     : CKey {stored_code!r} -> {CHEAT_CODE!r} (the cheat handlers require this marker)")
+        print("key      : CKey empty -> the cheats popup will offer the key field")
 
     if args.status or args.dry_run:
-        what = []
+        pending = []
         if not gate["patched"]:
-            what.append("library")
-        if not code_ok and prefs is not None:
-            what.append("cheat code marker")
-        print(f"\n({'status' if args.status else 'dry run'}) nothing written; pending: {', '.join(what) or 'nothing'}.")
+            pending.append("library")
+        if args.clear_key and stored_code:
+            pending.append("clear stored key")
+        print(f"\n({'status' if args.status else 'dry run'}) nothing written; pending: {', '.join(pending) or 'nothing'}.")
         return 0
 
-    if gate["patched"] and code_ok:
+    if gate["patched"] and not args.clear_key:
         print("\nstate    : ALREADY PATCHED - nothing to do.")
         return 0
 
@@ -733,29 +754,36 @@ def main() -> int:
 
         # verify every patch site in the freshly written library
         check = Elf(so_path)
-        tier_ok = check.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
-        debug_ok = check.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
-        code_ok_lib = (not cg) or all(check.at(site, 6) == NOP6 for site in (cg["verdict"],))
-        ok = tier_ok and debug_ok and code_ok_lib
-        print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})"
-              f"  tier={'ok' if tier_ok else 'BAD'} wrappers={'ok' if debug_ok else 'BAD'}"
-              f" codegate={'ok' if code_ok_lib else 'BAD'}")
+        wrappers_ok = check.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
+        if cg:
+            key_ok = (
+                check.at(cg["validator"], len(KEY_STUB)) == KEY_STUB
+                and all(check.at(site, 6) == NOP6 for site in cg["guards"])
+                and check.at(gate["tier_fn"], 6) != patch_mov_eax(gate["advanced"])
+            )
+            ok = wrappers_ok and key_ok
+            print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})"
+                  f"  keygate={'ok' if key_ok else 'BAD'} wrappers={'ok' if wrappers_ok else 'BAD'}"
+                  f" tier-pin={'absent' if check.at(gate['tier_fn'], 6) != patch_mov_eax(gate['advanced']) else 'STILL THERE'}")
+        else:
+            ok = wrappers_ok and check.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+            print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})")
         print(f"sha256   : {sha256(so_path.read_bytes()).hexdigest()}")
-        snip = disasm(so_path, gate["tier_fn"], 12)
+        snip = disasm(so_path, cg["validator"] if cg else gate["tier_fn"], 12)
         if snip:
             print("after    :")
             print(snip)
 
-    if not code_ok and prefs is not None:
+    if args.clear_key and stored_code and prefs is not None:
         if not prefs_backup.is_file() and prefs.is_file():
             prefs_backup.write_bytes(prefs.read_bytes())
-            print(f"backup   : {prefs_backup} (PlayerPrefs before the code marker)")
-        set_prefs_key(prefs, "CKey", CHEAT_CODE)
-        got = prefs_key_value(prefs, "CKey")
-        print(f"written  : {prefs} ({'verified' if got == CHEAT_CODE else 'VERIFY FAILED'})")
+            print(f"backup   : {prefs_backup}")
+        set_prefs_key(prefs, "CKey", "")
+        print(f"cleared  : stored key removed -> the cheats popup will offer the key field")
 
     print("\nunlocked : money, church reset, cum cheats, add any item, colour/quality changes, fish weight, + debug features.")
-    print("           in-game: cheats popup accepts any code (>=10 chars, e.g. A~1234567890)")
+    print("in-game  : cheats popup -> type any key of 10+ chars starting with A~ (e.g. " + KEY_HINT + ")")
+    print("           it is accepted, stored, cheats turn on; 'disable cheats' turns them off again.")
     print("undo     : mdrg-cheats --revert")
     return 0 if ok else 1
 

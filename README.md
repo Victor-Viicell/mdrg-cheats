@@ -40,17 +40,21 @@ the reject branch and never stores it — which is why a hand-typed key never en
 Two patches fix that, both located structurally (the checker is the one function called once by the
 tier function and three times in a row by the enter-code path):
 
-1. **The checker itself** gets an entry stub: a non-empty key string returns the advanced tier,
-   an empty one returns 0. Typed keys are therefore accepted without the RSA payload having to be real.
+1. **The checker itself** gets an entry stub: a non-empty key string returns the *top* tier the
+   callers know about (the debug tier — one above advanced, so the debug-gated item/quality/colour
+   cheats unlock too), an empty key returns 0.
 2. **The reject branches** of the enter-code coroutine are removed, so the store block is reached and
    the key is written.
+3. **The handlers' marker checks** on the stored key are forced true. Each cheat button re-reads the
+   stored key and tests it for a tier marker on *every* click; an in-game entry saves the bare payload,
+   so those tests failed and the menus never opened. The tool finds them structurally — a boolean call
+   right after a read of the stored key, set up with `mov rsi,rax` (a freshly decrypted marker) — and
+   rewrites each call as `mov eax,1` (22 sites in 0.97.12, all inside real cheat handlers).
 
 The tier function is left untouched, so the game's own state machine still drives everything: no key =
 "cheats disabled" with the key field offered, any key = cheats on, *disable cheats* = off again.
-`mdrg-cheats --clear-key` clears a stored key if you want the field back.
-
-The key must still be 10+ characters starting with `A~` (advanced) because the cheat handlers test the
-stored value for that marker before they run — e.g. `A~1234567890`.
+`mdrg-cheats --clear-key` clears a stored key if you want the field back; `--set-key [KEY]` writes a
+canonical one.
 
 ## Usage
 

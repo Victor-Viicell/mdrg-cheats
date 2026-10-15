@@ -474,8 +474,9 @@ def patch_state(live: Elf, gate: dict) -> dict:
     """
     key_gate = gate.get("code_gate")
     checks = gate.get("marker_checks") or []
+    stub = key_stub(stub_tier(gate))
     key_ok = (
-        live.at(key_gate["validator"], len(KEY_STUB)) == KEY_STUB
+        live.at(key_gate["validator"], len(stub)) == stub
         and all(live.at(site, 6) == NOP6 for site in key_gate["guards"])
         and all(live.at(site, 5) == FORCE_TRUE for site in checks)
         if key_gate
@@ -511,12 +512,23 @@ def patch_state(live: Elf, gate: dict) -> dict:
 # ------------------------------------------------------------------- patch bytes
 NOP6 = b"\x90" * 6
 
-# Entry stub for the cheat-key checker: "any key you type is a valid advanced
-# key, an empty key means cheats off". 19 bytes; both paths return, so the
-# original prologue it overwrites is never needed.
-#   test rdi,rdi / je zero / cmp dword [rdi+0x10],0 / je zero / mov eax,20 / ret
-#   zero: xor eax,eax / ret
-KEY_STUB = bytes.fromhex("4885ff740c837f10007406b814000000c331c0c3")
+# Entry stub for the cheat-key checker: "any key you type is the top-tier key,
+# an empty key means cheats off".
+def stub_tier(gate: dict) -> int:
+    """The tier the stub hands out: the highest one the callers know about, so
+    the advanced *and* the debug-gated cheats unlock (the dev's own debug tier)."""
+    return int(gate.get("debug_const") or gate["advanced"])
+
+
+def key_stub(tier: int) -> bytes:
+    """Checker entry stub: a non-empty key string yields `tier`, an empty one 0.
+
+    Both paths return, so the prologue these bytes overwrite is never needed:
+        test rdi,rdi / je zero / cmp dword [rdi+0x10],0 / je zero
+        mov eax,<tier> / ret / zero: xor eax,eax / ret
+    """
+    body = struct.pack("<BI", 0xB8, tier) + b"\xc3"
+    return b"\x48\x85\xff\x74\x0c\x83\x7f\x10\x00\x74\x06" + body + b"\x31\xc0\xc3"
 FORCE_TRUE = struct.pack("<BI", 0xB8, 1)   # mov eax,1 — same length as a `call rel32`
 
 
@@ -543,9 +555,9 @@ def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
         # reject branches so the enter-code path stores it. Nothing else: the
         # game's own tier/status/button state must stay honest.
         emit(
-            f"cheat-key check                 (any key is advanced={gate['advanced']})",
+            f"cheat-key check                 (any key is tier {stub_tier(gate)})",
             key_gate["validator"],
-            KEY_STUB,
+            key_stub(stub_tier(gate)),
         )
         for site in key_gate["guards"]:
             emit("cheat-key reject branch        (removed)", site, NOP6)
@@ -777,8 +789,9 @@ def main() -> int:
         print(f"wrappers : DebugEnabled@{gate['debug_site']:#x}({gate['debug_len']})  AnyCheatsEnabled@{gate['any_site']:#x}({gate['any_len']})")
     cg = gate.get("code_gate")
     checks = gate.get("marker_checks") or []
+    stub = key_stub(stub_tier(gate))
     if cg:
-        print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = advanced); "
+        print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = tier {stub_tier(gate)}); "
               f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed; "
               f"{len(checks)} stored-key marker checks forced true")
         if checks:
@@ -845,7 +858,7 @@ def main() -> int:
         check = Elf(so_path)
         if cg:
             key_ok = (
-                check.at(cg["validator"], len(KEY_STUB)) == KEY_STUB
+                check.at(cg["validator"], len(stub)) == stub
                 and all(check.at(site, 6) == NOP6 for site in cg["guards"])
                 and all(check.at(site, 5) == FORCE_TRUE for site in checks)
             )

@@ -25,6 +25,27 @@ tier values out of the callers' own comparisons*. A new game version, a new Unit
 different metadata version therefore changes nothing. If the developer ever rewrites the cheat system,
 the script refuses to touch the binary instead of corrupting it.
 
+## The second gate: the cheat key
+
+The tier alone is not enough. Every cheat handler (`RoomSheep::RoomCheatsButtonClicked`,
+`ItemStatsSheep::…`, `CheatWebsite::GetMoney`) first checks the **stored cheat key** — it must carry a
+tier marker (`"A~"` advanced / `"B~"` basic) and be at least 10 characters long — otherwise it returns
+silently: the buttons are there, the clicks fire, nothing happens.
+
+The key is written by the in-game *enter cheat code* button, whose coroutine runs the typed string
+through the game's RSA-backed checker (`Sheep::CheckIfSheepIsHappy`) three times: once with the key you
+typed, twice with embedded self-test keys. The typed key must come back positive or the coroutine takes
+the reject branch and never stores it — which is why a hand-typed key never enables anything.
+
+The script locates that coroutine structurally too: the checker is the one function called once by the
+tier function and three times in a row by the enter-code path. It then neutralises exactly one 6-byte
+branch — the verdict on *your* key — so the store block is reached no matter what you typed. The two
+self-test keys, the RSA check and the tier/disable logic are left untouched, so the game's own
+enable/disable flow keeps working.
+
+`mdrg-cheats --status` also repairs the key slot: the stored key is written into the game's own
+PlayerPrefs (`<persistentDataPath>/Saves/PlayerPrefs.pp`), located via the game's `app.info`.
+
 ## Usage
 
 ```sh

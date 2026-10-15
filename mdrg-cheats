@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -55,6 +56,7 @@ SEARCH_ROOTS = [
     Path.home() / "Games",
 ]
 WINDOW = 28  # bytes after a call in which callers test the return value
+FN_WINDOW = 0x400  # bytes scanned when walking a whole function body
 
 
 # --------------------------------------------------------------------------- ELF
@@ -182,6 +184,115 @@ def body_cmp_constants(elf: Elf, fn: int, window: int = 0x400) -> list[int]:
     return sorted(values)
 
 
+def build_site_index(elf: Elf) -> dict[int, list[int]]:
+    """Reverse call map: callee vaddr -> every direct `call` site."""
+    sites: dict[int, list[int]] = {}
+    for base, code in elf.exec_segments():
+        for i in range(len(code) - 5):
+            if code[i] != 0xE8:
+                continue
+            rel = struct.unpack_from("<i", code, i + 1)[0]
+            sites.setdefault(base + i + 5 + rel, []).append(base + i)
+    return sites
+
+
+def dense_clusters(sites: list[int], gap: int = 0x200) -> list[list[int]]:
+    """Group call sites so that consecutive sites are at most `gap` apart."""
+    out: list[list[int]] = []
+    for site in sorted(sites):
+        if out and site - out[-1][-1] <= gap:
+            out[-1].append(site)
+        else:
+            out.append([site])
+    return out
+
+
+def find_validator(sites: dict[int, list[int]], gate: dict) -> int | None:
+    """The cheat-code checker.
+
+    Signature: called once by GetCheatTier and three times in a row by the
+    in-game "enter cheat code" path - and nothing else calls it.
+    """
+    tier_fn = gate["tier_fn"]
+
+    def inside_tier(site: int) -> bool:
+        return tier_fn <= site < tier_fn + FN_WINDOW
+
+    best = None
+    for target, callers in sites.items():
+        if not 4 <= len(callers) <= 24:
+            continue
+        if not any(inside_tier(s) for s in callers):
+            continue
+        clusters = [c for c in dense_clusters(callers) if len(c) >= 3]
+        if not clusters:
+            continue
+        distance = min(abs(c[-1] - tier_fn) for c in clusters)
+        if best is None or distance < best[0]:
+            best = (distance, target)
+    return best[1] if best else None
+
+
+def forward_jumps(elf: Elf, start: int, window: int) -> list[tuple[int, int]]:
+    """6-byte conditional jumps (jcc rel32) that jump forward inside the window."""
+    body = elf.at(start, window)
+    hits = []
+    for j in range(len(body) - 6):
+        if body[j] == 0x0F and 0x80 <= body[j + 1] <= 0x8F:
+            rel = struct.unpack_from("<i", body, j + 2)[0]
+            target = start + j + 6 + rel
+            if start + j < target < start + window + 0x1000:
+                hits.append((start + j, target))
+    return hits
+
+
+def find_code_gate(elf: Elf, gate: dict, sites: dict[int, list[int]], validator: int) -> dict | None:
+    """The in-game "enter cheat code" path: the *other* caller of the code
+    checker. It runs the entered code through the checker last and rejects the
+    key when the checker does not recognise it - that single verdict branch is
+    what we disable, so any key the player types is accepted."""
+    callers = sites.get(validator, [])
+    outside = [s for s in callers if not gate["tier_fn"] <= s < gate["tier_fn"] + FN_WINDOW]
+    if not outside:
+        return None
+
+    # the last dense cluster is the state machine's three calls in a row
+    # (your code + two embedded self-test codes)
+    cluster = dense_clusters(outside)[-1]
+    last_call = cluster[-1]
+
+    hits = forward_jumps(elf, last_call + 5, 0x200)
+    if len(hits) < 2:
+        return None
+    counts: dict[int, int] = {}
+    for _site, target in hits:
+        counts[target] = counts.get(target, 0) + 1
+    reject, times = max(counts.items(), key=lambda kv: kv[1])
+    if times < 2:
+        return None
+
+    guards = [site for site, target in hits if target == reject]
+    dense = [guards[0]]
+    for site in guards[1:]:
+        if site - dense[-1] <= 0x40:
+            dense.append(site)
+        else:
+            break
+    verdict = dense[-1]          # the branch testing the *entered* key itself
+    accept = verdict + 6
+    tail = elf.at(accept, 0x80)
+    if not tail or tail[0] == 0x0F or b"\xe8" not in tail:
+        return None
+    return {
+        "validator": validator,
+        "call_sites": cluster,
+        "guards": dense,          # every reject branch, for reporting
+        "verdict": verdict,       # the key verdict we neutralise
+        "reject": reject,
+        "accept": accept,
+    }
+
+
 # ------------------------------------------------------------------- gate finding
 def find_gate_fresh(elf: Elf, index) -> dict | None:
     """Locate an *unpatched* gate: the callee shared by both boolean-wrapper shapes."""
@@ -274,25 +385,53 @@ def find_gate_patched(elf: Elf, index) -> dict | None:
 
 
 def analyse(elf: Elf) -> dict | None:
+    """Structural analysis of the *pristine* code. Never looks at patch state."""
     index = build_call_index(elf)
     gate = find_gate_fresh(elf, index)
     if gate is None:
         return find_gate_patched(elf, index)
 
-    advanced = gate["advanced"]
-    tier_ok = elf.at(gate["tier_fn"], 6) == patch_mov_eax(advanced)
-    tail_ok = elf.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
-    entry_ok = any(
-        elf.at(gate["debug_site"] - back, 6) == b"\xb8\x01\x00\x00\x00\xc3"
-        for back in range(0, 0xA0)
-    )
-    debug_ok = tail_ok or entry_ok
-    gate["patched"] = tier_ok and debug_ok
-    gate["partially_patched"] = tier_ok != debug_ok
+    # the cheat-key verdict lives in the coroutine that handles the in-game
+    # "enter cheat code" button: it is the last caller of the key checker.
+    sites = build_site_index(elf)
+    validator = find_validator(sites, gate)
+    gate["validator"] = validator
+    gate["code_gate"] = find_code_gate(elf, gate, sites, validator) if validator else None
+    gate["patched"] = False
+    gate["partially_patched"] = False
     return gate
 
 
+def patch_state(live: Elf, gate: dict) -> dict:
+    """Which of the three patches are already present in the installed library."""
+    tier_ok = live.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+    tail_ok = (
+        gate["debug_site"] is not None
+        and live.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
+    )
+    entry_ok = gate["debug_site"] is not None and any(
+        live.at(gate["debug_site"] - back, 6) == b"\xb8\x01\x00\x00\x00\xc3"
+        for back in range(0, 0xA0)
+    )
+    code_gate = gate.get("code_gate")
+    code_ok = (
+        all(live.at(site, 6) == NOP6 for site in (code_gate["verdict"],)) if code_gate else None
+    )
+    debug_ok = tail_ok or entry_ok
+    known = [tier_ok, debug_ok] + ([code_ok] if code_ok is not None else [])
+    return {
+        "tier": tier_ok,
+        "debug": debug_ok,
+        "code": code_ok,
+        "patched": all(known),
+        "partially_patched": not all(known),
+    }
+
+
 # ------------------------------------------------------------------- patch bytes
+NOP6 = b"\x90" * 6
+
+
 def patch_mov_eax(value: int) -> bytes:
     return struct.pack("<BI", 0xB8, value) + b"\xc3"
 
@@ -301,16 +440,33 @@ def patch_true(region_len: int) -> bytes:
     return struct.pack("<BI", 0xB8, 1) + b"\x90" * (region_len - 5)
 
 
-def apply_patch(elf: Elf, gate: dict) -> list[str]:
+def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
     log = []
-    for label, addr, payload in (
-        (f"GetCheatTier                   (returns advanced={gate['advanced']})", gate["tier_fn"], patch_mov_eax(gate["advanced"])),
-        (f"DebugEnabled wrapper tail     (forced true)", gate["debug_site"], patch_true(gate["debug_len"])),
-        (f"AnyCheatsEnabled wrapper tail (forced true)", gate["any_site"], patch_true(gate["any_len"])),
-    ):
+
+    def emit(label: str, addr: int, payload: bytes) -> None:
         off = elf.v2o(addr)
         log.append(f"{label}  vaddr {addr:#x}  file offset {off:#x}  <- {payload.hex(' ')}")
         elf.write(addr, payload)
+
+    if not (state and state.get("tier")):
+        emit(
+            f"GetCheatTier                   (returns advanced={gate['advanced']})",
+            gate["tier_fn"],
+            patch_mov_eax(gate["advanced"]),
+        )
+    if not (state and state.get("debug")):
+        emit(f"DebugEnabled wrapper tail     (forced true)", gate["debug_site"], patch_true(gate["debug_len"]))
+        emit(f"AnyCheatsEnabled wrapper tail (forced true)", gate["any_site"], patch_true(gate["any_len"]))
+
+    code_gate = gate.get("code_gate")
+    if code_gate and not (state and state.get("code")):
+        emit(
+            "cheat-key verdict              (accepts the key you type in-game)",
+            code_gate["verdict"],
+            NOP6,
+        )
+    if not log:
+        log.append("nothing to patch - library already matches")
     return log
 
 
@@ -350,9 +506,10 @@ def game_version(game_dir: Path) -> str:
     if receipt.is_file():
         try:
             with gzip.open(receipt) as fh:
-                build = ((json.load(fh).get("upload") or {}).get("build") or {})
-            if build.get("userVersion"):
-                return str(build["userVersion"])
+                doc = json.load(fh)
+            for build in ((doc.get("upload") or {}).get("build"), doc.get("build")):
+                if isinstance(build, dict) and build.get("userVersion"):
+                    return str(build["userVersion"])
         except Exception:
             pass
     for marker in ("version.txt", "VERSION"):
@@ -376,6 +533,60 @@ def game_running(game_dir: Path) -> list[str]:
         if str(game_dir) in cmd and (".x86_64" in cmd or "Dystopian" in cmd):
             hits.append(f"pid {proc.name}: {cmd.strip()[:90]}")
     return hits
+
+
+# ------------------------------------------------------- in-game cheat code marker
+CHEAT_MARKER = "A~"                       # prefix every in-game cheat handler tests for
+CHEAT_CODE = CHEAT_MARKER + "0" * 16      # ... and the stored code must be >= 10 chars
+
+
+def unity_data_dir(game_dir: Path) -> Path | None:
+    """~/.config/unity3d/<company>/<product>, read out of the game's app.info."""
+    app_info = None
+    for data in game_dir.glob("*_Data"):
+        if (data / "app.info").is_file():
+            app_info = data / "app.info"
+            break
+    if app_info is None:
+        return None
+    lines = [ln.strip() for ln in app_info.read_text(errors="replace").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return cfg / "unity3d" / lines[0] / lines[1]
+
+
+def prefs_store(game_dir: Path) -> Path | None:
+    d = unity_data_dir(game_dir)
+    return None if d is None else d / "Saves" / "PlayerPrefs.pp"
+
+
+def prefs_key_value(path: Path, key: str) -> str | None:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    for entry in data.get("data", []):
+        if entry.get("Key") == key:
+            return entry.get("Value")
+    return None
+
+
+def set_prefs_key(path: Path, key: str, value: str) -> bool:
+    """Set one key in the game's own PlayerPrefs store; True if the file changed."""
+    data = json.loads(path.read_text()) if path.is_file() else {"data": []}
+    entries = data.setdefault("data", [])
+    for entry in entries:
+        if entry.get("Key") == key:
+            if entry.get("Value") == value:
+                return False
+            entry["Value"] = value
+            break
+    else:
+        entries.append({"Key": key, "Value": value})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    return True
 
 
 def disasm(path: Path, vaddr: int, nbytes: int) -> str | None:
@@ -407,6 +618,8 @@ def main() -> int:
     version = game_version(game_dir)
     SHARE.mkdir(parents=True, exist_ok=True)
     backup = SHARE / f"GameAssembly.so.{version}.orig"
+    prefs = prefs_store(game_dir)
+    prefs_backup = SHARE / f"PlayerPrefs.pp.{version}.orig"
 
     print(f"game     : {game_dir}")
     print(f"version  : {version}")
@@ -425,10 +638,22 @@ def main() -> int:
             return 1
         so_path.write_bytes(backup.read_bytes())
         print(f"restored : {backup.name} -> GameAssembly.so")
+        prefs = prefs_store(game_dir)
+        if prefs and prefs.is_file():
+            if prefs_backup.is_file():
+                prefs.write_bytes(prefs_backup.read_bytes())
+                print(f"restored : {prefs_backup.name} -> {prefs}")
+            elif prefs_key_value(prefs, "CKey"):
+                set_prefs_key(prefs, "CKey", "")
+                print(f"cleared  : cheat code marker removed from {prefs.name}")
         print("state    : cheats disabled (pristine).")
         return 0
 
-    elf = Elf(so_path)
+    # Analysis always runs on pristine bytes: once the library is patched the
+    # original shapes are gone, so prefer the kept backup for discovery.
+    src_path = backup if backup.is_file() else so_path
+    elf = Elf(src_path)
+    live = Elf(so_path)
     gate = analyse(elf)
     if gate is None:
         print(
@@ -440,6 +665,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    state = patch_state(live, gate)
+    gate.update(state)
+    # patching pristine bytes always writes the full patch set; only skip
+    # already-applied patches when we are editing the installed library itself
+    skip = state if src_path == so_path else None
 
     off = elf.v2o(gate["tier_fn"])
     print(f"gate     : GetCheatTier @ vaddr {gate['tier_fn']:#x} (file offset {off:#x})")
@@ -448,18 +678,41 @@ def main() -> int:
     else:
         print(f"tier     : caller compares {gate['compared']} -> advanced={gate['advanced']} debug={gate['debug_const']} (source: {gate['source']})")
         print(f"wrappers : DebugEnabled@{gate['debug_site']:#x}({gate['debug_len']})  AnyCheatsEnabled@{gate['any_site']:#x}({gate['any_len']})")
+    cg = gate.get("code_gate")
+    if cg:
+        print(f"codegate : key checker@{cg['validator']:#x}; enter-code path {cg['call_sites'][0]:#x}; "
+              f"verdict branch {cg['verdict']:#x} (rejects at {cg['reject']:#x} -> store {cg['accept']:#x})")
+    elif gate["source"] != "recovered":
+        print("codegate : !! not found - entering a key in-game would still be rejected")
 
     if gate["patched"]:
-        print("\nstate    : ALREADY PATCHED - nothing to do.")
-        return 0
+        print("\nlibrary  : ALREADY PATCHED (tier + wrappers + code gate).")
+    else:
+        plan = apply_patch(elf, gate, skip)
+        print("\npatches:")
+        for line in plan:
+            print("  - " + line)
 
-    plan = apply_patch(elf, gate)
-    print("\npatches:")
-    for line in plan:
-        print("  - " + line)
+    stored_code = prefs_key_value(prefs, "CKey") if (prefs and prefs.is_file()) else None
+    code_ok = bool(stored_code) and stored_code.startswith(CHEAT_MARKER) and len(stored_code) >= 10
+    if prefs is None:
+        print("code     : !! could not derive the game's PlayerPrefs path (app.info missing)")
+    elif code_ok:
+        print(f"code     : CKey {stored_code!r} (marker {CHEAT_MARKER!r} + >=10 chars) - ok")
+    else:
+        print(f"code     : CKey {stored_code!r} -> {CHEAT_CODE!r} (the cheat handlers require this marker)")
 
     if args.status or args.dry_run:
-        print(f"\n({'status' if args.status else 'dry run'}) nothing written.")
+        what = []
+        if not gate["patched"]:
+            what.append("library")
+        if not code_ok and prefs is not None:
+            what.append("cheat code marker")
+        print(f"\n({'status' if args.status else 'dry run'}) nothing written; pending: {', '.join(what) or 'nothing'}.")
+        return 0
+
+    if gate["patched"] and code_ok:
+        print("\nstate    : ALREADY PATCHED - nothing to do.")
         return 0
 
     running = game_running(game_dir)
@@ -469,23 +722,40 @@ def main() -> int:
             print("   " + line, file=sys.stderr)
         return 1
 
-    if backup.is_file():
-        print(f"\nbackup   : {backup.name} (already present for this version, kept)")
-    else:
-        backup.write_bytes(elf.data)
-        print(f"\nbackup   : {backup}")
+    ok = True
+    if not gate["patched"]:
+        if backup.is_file():
+            print(f"\nbackup   : {backup.name} (already present for this version, kept)")
+        else:
+            backup.write_bytes(live.data)
+            print(f"\nbackup   : {backup}")
+        so_path.write_bytes(elf.render())
 
-    so_path.write_bytes(elf.render())
+        # verify every patch site in the freshly written library
+        check = Elf(so_path)
+        tier_ok = check.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+        debug_ok = check.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
+        code_ok_lib = (not cg) or all(check.at(site, 6) == NOP6 for site in (cg["verdict"],))
+        ok = tier_ok and debug_ok and code_ok_lib
+        print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})"
+              f"  tier={'ok' if tier_ok else 'BAD'} wrappers={'ok' if debug_ok else 'BAD'}"
+              f" codegate={'ok' if code_ok_lib else 'BAD'}")
+        print(f"sha256   : {sha256(so_path.read_bytes()).hexdigest()}")
+        snip = disasm(so_path, gate["tier_fn"], 12)
+        if snip:
+            print("after    :")
+            print(snip)
 
-    check = Elf(so_path)
-    ok = check.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
-    print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})")
-    print(f"sha256   : {sha256(so_path.read_bytes()).hexdigest()}")
-    snip = disasm(so_path, gate["tier_fn"], 12)
-    if snip:
-        print("after    :")
-        print(snip)
+    if not code_ok and prefs is not None:
+        if not prefs_backup.is_file() and prefs.is_file():
+            prefs_backup.write_bytes(prefs.read_bytes())
+            print(f"backup   : {prefs_backup} (PlayerPrefs before the code marker)")
+        set_prefs_key(prefs, "CKey", CHEAT_CODE)
+        got = prefs_key_value(prefs, "CKey")
+        print(f"written  : {prefs} ({'verified' if got == CHEAT_CODE else 'VERIFY FAILED'})")
+
     print("\nunlocked : money, church reset, cum cheats, add any item, colour/quality changes, fish weight, + debug features.")
+    print("           in-game: cheats popup accepts any code (>=10 chars, e.g. A~1234567890)")
     print("undo     : mdrg-cheats --revert")
     return 0 if ok else 1
 

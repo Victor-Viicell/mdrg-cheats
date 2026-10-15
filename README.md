@@ -45,11 +45,14 @@ tier function and three times in a row by the enter-code path):
    cheats unlock too), an empty key returns 0.
 2. **The reject branches** of the enter-code coroutine are removed, so the store block is reached and
    the key is written.
-3. **The handlers' marker checks** on the stored key are forced true. Each cheat button re-reads the
-   stored key and tests it for a tier marker on *every* click; an in-game entry saves the bare payload,
-   so those tests failed and the menus never opened. The tool finds them structurally — a boolean call
-   right after a read of the stored key, set up with `mov rsi,rax` (a freshly decrypted marker) — and
-   rewrites each call as `mov eax,1` (22 sites in 0.97.12, all inside real cheat handlers).
+3. **The handlers' marker checks** on the stored key are answered "this key is valid". Each cheat button
+   re-reads the stored key and tests it on *every* click; an in-game entry saves the bare payload, so
+   those tests failed and the menus never opened. The tool finds them structurally — a boolean call right
+   after a read of the stored key, set up with `mov rsi,rax` (a freshly decrypted marker) — and answers
+   them the right way round: each check is classified by whether its branch leads to the handler's
+   "give up quietly" label (the target of its own `cmp [key+0x10],10; jl` length guard), because the two
+   flavours — `key.StartsWith(marker)` (valid when true) and `key == expectedCode` (valid when false) —
+   need opposite values. 22 sites in 0.97.12, all inside real cheat handlers (4 forced true, 18 false).
 
 The tier function is left untouched, so the game's own state machine still drives everything: no key =
 "cheats disabled" with the key field offered, any key = cheats on, *disable cheats* = off again.

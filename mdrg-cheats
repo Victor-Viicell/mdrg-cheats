@@ -326,28 +326,85 @@ def is_branch(code: bytes) -> bool:
     )
 
 
-def find_marker_checks(elf: Elf, sites: dict[int, list[int]], getter: int) -> list[int]:
-    """Every marker verdict the cheat handlers run on the stored key.
+def find_key_bails(elf: Elf, sites: dict[int, list[int]], getter: int) -> set[int]:
+    """Targets of the handlers' key-length guards: `cmp dword [reg+0x10],<min>; jl`.
+
+    Every check inside a handler jumps to that one "give up quietly" label, so
+    looking it up near the places that read the stored key tells a marker
+    check's branches apart: a branch to it means the tested answer was "this key
+    is wrong". Kept tight to the key-reading sites to avoid unrelated matches.
+    """
+    bails: set[int] = set()
+    for site in sites.get(getter, []):
+        body = elf.at(site + 5, 0x400)
+        for i in range(len(body) - 10):
+            if body[i] != 0x83 or (body[i + 1] & 0xF8) != 0x78 or body[i + 2] != 0x10:
+                continue                                   # cmp dword [reg+0x10], imm8
+            if not 1 <= body[i + 3] <= 0x20:                # a plausible key-length minimum
+                continue
+            j = i + 4
+            if 0x70 <= body[j] <= 0x7F:                     # short jcc rel8
+                target = site + 5 + j + 2 + struct.unpack_from("<b", body, j + 1)[0]
+            elif body[j] == 0x0F and 0x80 <= body[j + 1] <= 0x8F:
+                target = site + 5 + j + 6 + struct.unpack_from("<i", body, j + 2)[0]
+            else:
+                continue
+            if target > site + 5 + j:
+                bails.add(target)
+    return bails
+
+
+def branch_after(elf: Elf, site: int) -> tuple[int, int] | None:
+    """The (kind, target) of the conditional branch right after a bool call:
+    kind 0 = je (taken when the answer is true), 1 = jne."""
+    after = elf.at(site + 5, 8)
+    if len(after) < 4 or after[:2] != b"\x84\xc0":          # test al,al
+        return None
+    j = 2
+    if 0x70 <= after[j] <= 0x7F:
+        target = site + 5 + j + 2 + struct.unpack_from("<b", after, j + 1)[0]
+        taken_true = after[j] in (0x74, 0x75)
+        return (0 if after[j] == 0x74 else 1, target) if taken_true else None
+    if after[j] == 0x0F and 0x80 <= after[j + 1] <= 0x8F:
+        target = site + 5 + j + 6 + struct.unpack_from("<i", after, j + 2)[0]
+        return (0 if after[j + 1] == 0x84 else 1, target)
+    return None
+
+
+TRUE5 = struct.pack("<BI", 0xB8, 1)      # mov eax,1
+FALSE5 = b"\x31\xc0\x90\x90\x90"         # xor eax,eax + nops
+
+
+def find_marker_checks(elf: Elf, sites: dict[int, list[int]], getter: int, bails: set[int]) -> list[tuple[int, bytes]]:
+    """Every marker verdict the cheat handlers run on the stored key, with the
+    value that makes it answer "this key is valid".
 
     Shape: the key was just read, then `mov rsi,rax` passes a freshly built
-    (decrypted) marker literal and the call's boolean result is branched on:
-
-        <read stored key> ... 48 89 c6  e8 .. .. .. ..  84 c0  75/0f 8x
-
-    Forcing these to true lets any stored key pass the handlers' marker test.
+    (decrypted) marker/expected code and the call's boolean result is branched
+    on. Two flavours appear - a prefix test (valid when true) and an equality
+    test against the expected code (valid when false) - so the forced value is
+    derived from the branch that leads to the handler's give-up label.
     """
-    hits: list[int] = []
+    hits: list[tuple[int, bytes]] = []
     for site in sites.get(getter, []):
         body = elf.at(site + 5, 0x140)
         for j in range(len(body) - 6):
             if body[j] != 0xE8:
                 continue
-            before = body[max(j - 0x10, 0):j]
-            if b"\x48\x89\xc6" not in before:                  # mov rsi,rax : the marker
+            if b"\x48\x89\xc6" not in body[max(j - 0x10, 0):j]:      # mov rsi,rax
                 continue
-            after = body[j + 5:j + 9]
-            if after[:2] == b"\x84\xc0" and is_branch(after[2:4]):   # test al,al; jcc
-                hits.append(site + 5 + j)
+            call_site = site + 5 + j
+            branch = branch_after(elf, call_site)
+            if branch is None:
+                continue
+            kind, target = branch
+            # kind 0 == je (taken when true), 1 == jne (taken when false)
+            to_bail = target in bails
+            if to_bail:
+                valid_true = kind == 1        # the branch fires on the *wrong* answer
+            else:
+                valid_true = kind == 0        # the branch itself is the success path
+            hits.append((call_site, TRUE5 if valid_true else FALSE5))
     return sorted(set(hits))
 
 
@@ -457,7 +514,9 @@ def analyse(elf: Elf) -> dict | None:
     gate["code_gate"] = find_code_gate(elf, gate, sites, validator) if validator else None
     getter = find_code_getter(elf, gate, validator) if validator else None
     gate["code_getter"] = getter
-    gate["marker_checks"] = find_marker_checks(elf, sites, getter) if getter else []
+    bails = find_key_bails(elf, sites, getter) if getter else set()
+    gate["key_bails"] = sorted(bails)
+    gate["marker_checks"] = find_marker_checks(elf, sites, getter, bails) if getter else []
     gate["tier_upgrade"] = find_tier_upgrade(elf, gate)
     gate["patched"] = False
     gate["partially_patched"] = False
@@ -482,7 +541,7 @@ def patch_state(live: Elf, gate: dict) -> dict:
     key_ok = (
         live.at(key_gate["validator"], len(stub)) == stub
         and all(live.at(site, 6) == NOP6 for site in key_gate["guards"])
-        and all(live.at(site, 5) == FORCE_TRUE for site in checks)
+        and all(live.at(site, 5) == payload for site, payload in checks)
         and (upgrade_bytes is None or live.at(gate["tier_upgrade"], 5) == upgrade_bytes)
         if key_gate
         else None
@@ -559,7 +618,6 @@ def key_stub(tier: int) -> bytes:
     """
     body = struct.pack("<BI", 0xB8, tier) + b"\xc3"
     return b"\x48\x85\xff\x74\x0c\x83\x7f\x10\x00\x74\x06" + body + b"\x31\xc0\xc3"
-FORCE_TRUE = struct.pack("<BI", 0xB8, 1)   # mov eax,1 — same length as a `call rel32`
 
 
 def patch_mov_eax(value: int) -> bytes:
@@ -591,8 +649,13 @@ def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
         )
         for site in key_gate["guards"]:
             emit("cheat-key reject branch        (removed)", site, NOP6)
-        for site in gate.get("marker_checks") or []:
-            emit("cheat-key marker check          (forced true)", site, FORCE_TRUE)
+        for site, payload in gate.get("marker_checks") or []:
+            emit(
+                "cheat-key marker check          (forced valid: "
+                + ("true" if payload == TRUE5 else "false") + ")",
+                site,
+                payload,
+            )
         if gate.get("tier_upgrade"):
             emit(
                 f"tier upgrade                    (advanced -> debug, as its own debug pref would)",
@@ -831,11 +894,13 @@ def main() -> int:
         print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = tier {stub_tier(gate)}"
               + (f", upgraded to {gate['debug_const']}" if upg else "") + "); "
               f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed; "
-              f"{len(checks)} stored-key marker checks forced true")
+              f"{len(checks)} stored-key marker checks forced valid")
         if upg:
             print(f"           tier upgrade pair @{upg:#x} (advanced -> debug)")
         if checks:
-            print(f"           marker checks at {checks[0]:#x} .. {checks[-1]:#x}")
+            trues = sum(1 for _s, p in checks if p == TRUE5)
+            print(f"           marker checks at {checks[0][0]:#x} .. {checks[-1][0]:#x} "
+                  f"({trues} forced true / {len(checks) - trues} forced false)")
     elif gate["source"] != "recovered":
         print("keygate  : !! not found - falling back to pinning the tier")
 
@@ -900,7 +965,7 @@ def main() -> int:
             key_ok = (
                 check.at(cg["validator"], len(stub)) == stub
                 and all(check.at(site, 6) == NOP6 for site in cg["guards"])
-                and all(check.at(site, 5) == FORCE_TRUE for site in checks)
+                and all(check.at(site, 5) == payload for site, payload in checks)
             )
             tier_clean = check.at(gate["tier_fn"], 6) != patch_mov_eax(gate["advanced"])
             wrappers_clean = check.at(gate["debug_site"], gate["debug_len"]) != patch_true(gate["debug_len"])

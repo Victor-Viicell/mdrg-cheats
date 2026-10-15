@@ -458,6 +458,7 @@ def analyse(elf: Elf) -> dict | None:
     getter = find_code_getter(elf, gate, validator) if validator else None
     gate["code_getter"] = getter
     gate["marker_checks"] = find_marker_checks(elf, sites, getter) if getter else []
+    gate["tier_upgrade"] = find_tier_upgrade(elf, gate)
     gate["patched"] = False
     gate["partially_patched"] = False
     return gate
@@ -475,13 +476,18 @@ def patch_state(live: Elf, gate: dict) -> dict:
     key_gate = gate.get("code_gate")
     checks = gate.get("marker_checks") or []
     stub = key_stub(stub_tier(gate))
+    upgrade_bytes = (
+        struct.pack("<BI", 0xBB, gate["debug_const"]) if gate.get("tier_upgrade") else None
+    )
     key_ok = (
         live.at(key_gate["validator"], len(stub)) == stub
         and all(live.at(site, 6) == NOP6 for site in key_gate["guards"])
         and all(live.at(site, 5) == FORCE_TRUE for site in checks)
+        and (upgrade_bytes is None or live.at(gate["tier_upgrade"], 5) == upgrade_bytes)
         if key_gate
         else None
     )
+    tier_pinned = live.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
     tail_ok = (
         gate["debug_site"] is not None
         and live.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
@@ -491,14 +497,13 @@ def patch_state(live: Elf, gate: dict) -> dict:
         for back in range(0, 0xA0)
     )
     wrappers_forced = tail_ok or entry_ok
-    tier_pinned = live.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
 
     if key_gate:
         stale = tier_pinned or wrappers_forced
         complete = bool(key_ok) and not stale
     else:
-        complete = tier_pinned and wrappers_forced
         stale = False
+        complete = tier_pinned and wrappers_forced
     return {
         "key": key_ok,
         "wrappers_forced": wrappers_forced,
@@ -515,9 +520,34 @@ NOP6 = b"\x90" * 6
 # Entry stub for the cheat-key checker: "any key you type is the top-tier key,
 # an empty key means cheats off".
 def stub_tier(gate: dict) -> int:
-    """The tier the stub hands out: the highest one the callers know about, so
-    the advanced *and* the debug-gated cheats unlock (the dev's own debug tier)."""
-    return int(gate.get("debug_const") or gate["advanced"])
+    """The tier the checker stub hands out. It must be a value the tier function
+    itself accepts (basic/advanced) - anything else makes it take its "invalid
+    key" path, which *clears* the stored key and reports cheats disabled."""
+    return int(gate["advanced"])
+
+
+def find_tier_upgrade(elf: Elf, gate: dict) -> int | None:
+    """The tier function's advance->debug upgrade pair:
+
+        mov eax,<debug> ; mov ebx,<advanced> ; cmovne ebx,eax
+
+    ...where the second value is what it returns when its internal debug pref is
+    off. Rewriting that immediate to the debug tier unlocks the debug-gated
+    cheats (ItemStats quality/colour, debug story tools) without ever feeding the
+    function a tier value it would reject."""
+    if not gate.get("debug_const"):
+        return None
+    body = elf.at(gate["tier_fn"], FN_WINDOW)
+    debug, advanced = gate["debug_const"], gate["advanced"]
+    for j in range(10, len(body) - 16):
+        if body[j:j + 3] != b"\x0f\x45\xd8":                       # cmovne ebx,eax
+            continue
+        if body[j - 5] != 0xBB or struct.unpack_from("<I", body, j - 4)[0] != advanced:
+            continue
+        if body[j - 10] != 0xB8 or struct.unpack_from("<I", body, j - 9)[0] != debug:
+            continue
+        return gate["tier_fn"] + j - 5
+    return None
 
 
 def key_stub(tier: int) -> bytes:
@@ -563,6 +593,12 @@ def apply_patch(elf: Elf, gate: dict, state: dict | None = None) -> list[str]:
             emit("cheat-key reject branch        (removed)", site, NOP6)
         for site in gate.get("marker_checks") or []:
             emit("cheat-key marker check          (forced true)", site, FORCE_TRUE)
+        if gate.get("tier_upgrade"):
+            emit(
+                f"tier upgrade                    (advanced -> debug, as its own debug pref would)",
+                gate["tier_upgrade"],
+                struct.pack("<BI", 0xBB, gate["debug_const"]),
+            )
         return log
 
     # no key gate found: fall back to pinning the tier and the wrappers
@@ -791,9 +827,13 @@ def main() -> int:
     checks = gate.get("marker_checks") or []
     stub = key_stub(stub_tier(gate))
     if cg:
-        print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = tier {stub_tier(gate)}); "
+        upg = gate.get("tier_upgrade")
+        print(f"keygate  : checker @{cg['validator']:#x} (stub: non-empty key = tier {stub_tier(gate)}"
+              + (f", upgraded to {gate['debug_const']}" if upg else "") + "); "
               f"enter-code path {cg['call_sites'][0]:#x} with {len(cg['guards'])} reject branches removed; "
               f"{len(checks)} stored-key marker checks forced true")
+        if upg:
+            print(f"           tier upgrade pair @{upg:#x} (advanced -> debug)")
         if checks:
             print(f"           marker checks at {checks[0]:#x} .. {checks[-1]:#x}")
     elif gate["source"] != "recovered":
@@ -864,9 +904,14 @@ def main() -> int:
             )
             tier_clean = check.at(gate["tier_fn"], 6) != patch_mov_eax(gate["advanced"])
             wrappers_clean = check.at(gate["debug_site"], gate["debug_len"]) != patch_true(gate["debug_len"])
-            ok = key_ok and tier_clean and wrappers_clean
+            upgrade_ok = (
+                gate.get("tier_upgrade") is None
+                or check.at(gate["tier_upgrade"], 5) == struct.pack("<BI", 0xBB, gate["debug_const"])
+            )
+            ok = key_ok and tier_clean and wrappers_clean and upgrade_ok
             print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})"
                   f"  keygate={'ok' if key_ok else 'BAD'}"
+                  f" upgrade={'ok' if upgrade_ok else 'BAD'}"
                   f" tier={'pristine' if tier_clean else 'STILL PINNED'}"
                   f" wrappers={'pristine' if wrappers_clean else 'STILL FORCED'}")
         else:

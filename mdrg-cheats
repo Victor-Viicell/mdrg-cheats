@@ -639,6 +639,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="show patches, change nothing")
     ap.add_argument("--revert", action="store_true", help="restore the pristine library")
     ap.add_argument("--clear-key", action="store_true", help="clear the stored cheat key so the game offers the key field")
+    ap.add_argument(
+        "--set-key", nargs="?", const=KEY_HINT, default=None, metavar="KEY",
+        help=f"write KEY into the game's PlayerPrefs (default {KEY_HINT!r}); the cheat handlers "
+             f"re-test the stored value for the {CHEAT_MARKER!r} marker on every click",
+    )
     ap.add_argument("--force", action="store_true", help="proceed even if the game is running")
     args = ap.parse_args()
 
@@ -724,11 +729,14 @@ def main() -> int:
             print("  - " + line)
 
     stored_code = prefs_key_value(prefs, "CKey") if (prefs and prefs.is_file()) else None
+    key_wanted = args.set_key if args.set_key is not None else None
     if prefs is None:
         print("key      : !! could not derive the game's PlayerPrefs path (app.info missing)")
     elif stored_code:
-        print(f"key      : CKey = {stored_code!r} -> the game boots with cheats already on "
-              f"(press 'disable cheats' in-game, or pass --clear-key, to type your own)")
+        marked = stored_code.startswith(CHEAT_MARKER) and len(stored_code) >= 10
+        print(f"key      : CKey = {stored_code!r}"
+              + ("" if marked else f"  !! the cheat handlers need a {CHEAT_MARKER!r} marker "
+                                   f"and 10+ chars - they bail on this value (run --set-key)"))
     else:
         print("key      : CKey empty -> the cheats popup will offer the key field")
 
@@ -738,10 +746,12 @@ def main() -> int:
             pending.append("library")
         if args.clear_key and stored_code:
             pending.append("clear stored key")
+        if key_wanted is not None and key_wanted != stored_code:
+            pending.append(f"stored key -> {key_wanted!r}")
         print(f"\n({'status' if args.status else 'dry run'}) nothing written; pending: {', '.join(pending) or 'nothing'}.")
         return 0
 
-    if gate["patched"] and not args.clear_key:
+    if gate["patched"] and not args.clear_key and key_wanted is None:
         print("\nstate    : ALREADY PATCHED - nothing to do.")
         return 0
 
@@ -789,7 +799,19 @@ def main() -> int:
             prefs_backup.write_bytes(prefs.read_bytes())
             print(f"backup   : {prefs_backup}")
         set_prefs_key(prefs, "CKey", "")
-        print(f"cleared  : stored key removed -> the cheats popup will offer the key field")
+        print("cleared  : stored key removed -> the cheats popup will offer the key field")
+
+    if key_wanted is not None:
+        if prefs is None:
+            print("!! cannot write the key: PlayerPrefs path unknown", file=sys.stderr)
+            return 1
+        if not prefs_backup.is_file() and prefs.is_file():
+            prefs_backup.write_bytes(prefs.read_bytes())
+            print(f"backup   : {prefs_backup}")
+        set_prefs_key(prefs, "CKey", key_wanted)
+        got = prefs_key_value(prefs, "CKey")
+        print(f"stored   : CKey = {got!r} ({'verified' if got == key_wanted else 'VERIFY FAILED'}) "
+              f"-> in-game cheat handlers will see the {CHEAT_MARKER!r} marker")
 
     print("\nunlocked : with a stored key: money, church reset, cum cheats, add any item, colour/quality changes, fish weight.")
     print("in-game  : cheats popup -> type any key of 10+ chars starting with A~ (e.g. " + KEY_HINT + ")")

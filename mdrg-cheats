@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+mdrg-cheats - version-proof cheat enabler for
+"!Omega Factorial Omega: My Dystopian Robot Girlfriend" (IL2CPP builds).
+
+WHY THIS SURVIVES GAME UPDATES
+------------------------------
+Every piece of cheat functionality funnels through ONE generated method,
+Options.GetCheatTier(), which returns a CheatTierEnum value:
+
+    NoCheats = 10-ish ladder ... in 0.97.12:  0 / 10 (basic) / 20 (advanced) / 30 (debug)
+
+Everything else is derived from it. Verified by disassembling all 8 call sites in
+0.97.12:  four "cmp eax,0x14; setge"  (=> tier >= advanced)
+           one  "test eax,eax; setg"   (=> AnyCheatsEnabled: tier > 0)
+           one  "cmp eax,0x1e; sete"   (=> DebugEnabled:   tier == debug)
+No caller compares the tier with == against the advanced value, so returning the
+advanced value unlocks basic + advanced cheats, and neutralising the debug wrapper
+unlocks the debug features too.
+
+Nothing is hardcoded: no addresses, no enum values, no metadata parsing, no strings,
+no external tools. The script finds the gate structurally from the call graph
+(it is the callee shared by a "<call>; cmp eax,K; sete al" wrapper and a
+"<call>; test eax,eax; setg al" wrapper), then *reads the tier values out of the
+callers' own comparisons*. A new game version, a new Unity version, or a different
+metadata version therefore changes nothing. If the developer ever rewrites the cheat
+system, the script refuses to touch the binary instead of corrupting it.
+
+USAGE
+  mdrg-cheats                 auto-find the game and patch it
+  mdrg-cheats --status        report state, change nothing
+  mdrg-cheats --dry-run       show the exact patches, change nothing
+  mdrg-cheats --revert        restore the pristine GameAssembly.so
+  mdrg-cheats --game-dir DIR  point at a specific install
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import struct
+import subprocess
+import sys
+from hashlib import sha256
+from pathlib import Path
+from shutil import which
+
+SHARE = Path.home() / ".local/share/mdrg-cheats"
+GAME_HINTS = ("dystopian", "factorial-omega", "factorial_omega", "robo")
+SEARCH_ROOTS = [
+    Path.home() / ".config/itch/apps",
+    Path.home() / ".steam/steam/steamapps/common",
+    Path.home() / ".local/share/Steam/steamapps/common",
+    Path.home() / "Games",
+]
+WINDOW = 28  # bytes after a call in which callers test the return value
+
+
+# --------------------------------------------------------------------------- ELF
+class Elf:
+    """Minimal ELF64 reader: vaddr <-> file offset via PT_LOAD headers."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = path.read_bytes()
+        if self.data[:4] != b"\x7fELF":
+            raise SystemExit(f"{path} is not an ELF file")
+        if self.data[4] != 2:
+            raise SystemExit("only 64-bit ELF is supported")
+        if struct.unpack_from("<H", self.data, 0x12)[0] != 0x3E:
+            raise SystemExit("not an x86-64 binary")
+        self.pt_load: list[tuple[int, int, int, int]] = []
+        phoff = struct.unpack_from("<Q", self.data, 0x20)[0]
+        phentsize = struct.unpack_from("<H", self.data, 0x36)[0]
+        phnum = struct.unpack_from("<H", self.data, 0x38)[0]
+        for i in range(phnum):
+            off = phoff + i * phentsize
+            if struct.unpack_from("<I", self.data, off)[0] != 1:
+                continue
+            self.pt_load.append(
+                (
+                    struct.unpack_from("<Q", self.data, off + 16)[0],  # p_vaddr
+                    struct.unpack_from("<Q", self.data, off + 8)[0],   # p_offset
+                    struct.unpack_from("<Q", self.data, off + 32)[0],  # p_filesz
+                    struct.unpack_from("<I", self.data, off + 4)[0],   # p_flags
+                )
+            )
+        self._writes: dict[int, bytes] = {}
+
+    def v2o(self, vaddr: int) -> int | None:
+        for vaddr0, off0, size, _f in self.pt_load:
+            if vaddr0 <= vaddr < vaddr0 + size:
+                return off0 + vaddr - vaddr0
+        return None
+
+    def o2v(self, off: int) -> int | None:
+        for vaddr0, off0, size, _f in self.pt_load:
+            if off0 <= off < off0 + size:
+                return vaddr0 + off - off0
+        return None
+
+    def at(self, vaddr: int, n: int) -> bytes:
+        off = self.v2o(vaddr)
+        return b"" if off is None else self.data[off:off + n]
+
+    def write(self, vaddr: int, payload: bytes) -> None:
+        off = self.v2o(vaddr)
+        if off is None:
+            raise SystemExit(f"cannot map vaddr {vaddr:#x} to a file offset")
+        self._writes[off] = payload
+
+    def render(self) -> bytes:
+        out = bytearray(self.data)
+        for off, payload in self._writes.items():
+            out[off:off + len(payload)] = payload
+        return bytes(out)
+
+    def exec_segments(self):
+        for vaddr0, off0, size, flags in self.pt_load:
+            if flags & 1:
+                yield vaddr0, self.data[off0:off0 + size]
+
+
+# ------------------------------------------------------------------- call graph
+def cmp_reg_imm(chunk: bytes, j: int):
+    """Decode `cmp reg, imm` at j -> (imm, length) or None."""
+    b, m = chunk[j], chunk[j + 1]
+    if b == 0x83 and (m & 0xF8) == 0xF8:          # cmp r32, imm8
+        return chunk[j + 2], 3
+    if b == 0x81 and (m & 0xF8) == 0xF8:          # cmp r32, imm32
+        return struct.unpack_from("<I", chunk, j + 2)[0], 6
+    if b == 0x3D:                                  # cmp eax, imm32
+        return struct.unpack_from("<I", chunk, j + 1)[0], 5
+    return None
+
+
+def build_call_index(elf: Elf):
+    """One pass over the code: target -> {'sete': [(site, imm, len)], 'setg': [(site, len)], 'cmp': [imm]}.
+
+    `sete`/`setg` require the boolean-wrapper shape to sit *immediately* after the call
+    (that is the strong signal that pins GetCheatTier). `cmp` harvests every immediate
+    the callers test the return value against, anywhere in the following window.
+    """
+    index: dict[int, dict[str, list]] = {}
+    for base, code in elf.exec_segments():
+        n = len(code)
+        for i in range(n - 5):
+            if code[i] != 0xE8:
+                continue
+            rel = struct.unpack_from("<i", code, i + 1)[0]
+            target = base + i + 5 + rel
+            site = base + i
+            chunk = code[i + 5:i + 5 + WINDOW]
+            entry = index.setdefault(target, {"sete": [], "setg": [], "cmp": []})
+
+            # --- strict wrapper shapes, straight after the call ---
+            decoded = cmp_reg_imm(chunk, 0)
+            if decoded and chunk[decoded[1]:decoded[1] + 3] == b"\x0f\x94\xc0":      # cmp; sete al
+                entry["sete"].append((site, decoded[0], 5 + decoded[1] + 3))         # call + cmp + sete
+            if chunk[0:2] == b"\x85\xc0" and chunk[2:5] == b"\x0f\x9f\xc0":           # test eax,eax; setg al
+                entry["setg"].append((site, 5 + 2 + 3))
+            elif chunk[0:3] == b"\x48\x85\xc0" and chunk[3:6] == b"\x0f\x9f\xc0":     # test rax,rax; setg al
+                entry["setg"].append((site, 5 + 3 + 3))
+
+            # --- tier values the callers compare against ---
+            for j in range(len(chunk) - 8):
+                other = cmp_reg_imm(chunk, j)
+                if other and 0 < other[0] < 0x10000:
+                    entry["cmp"].append((site, other[0]))
+    return index
+
+
+def body_cmp_constants(elf: Elf, fn: int, window: int = 0x400) -> list[int]:
+    """Fallback tier values: what the function itself compares against."""
+    body = elf.at(fn, window)
+    values = set()
+    for j in range(len(body) - 8):
+        decoded = cmp_reg_imm(body, j)
+        if decoded and 0 < decoded[0] < 0x10000:
+            values.add(decoded[0])
+    return sorted(values)
+
+
+# ------------------------------------------------------------------- gate finding
+def find_gate_fresh(elf: Elf, index) -> dict | None:
+    """Locate an *unpatched* gate: the callee shared by both boolean-wrapper shapes."""
+    candidates = [t for t, e in index.items() if e["sete"] and e["setg"]]
+    if not candidates:
+        return None
+
+    scored = []
+    for target in candidates:
+        entry = index[target]
+        debug_values = sorted({imm for _s, imm, _l in entry["sete"] if 0 < imm < 0x10000})
+        if not debug_values:
+            continue
+        debug_const = max(debug_values)
+
+        # Which value do the callers actually gate on? The constant tested at the most
+        # distinct call sites is the real tier value (junk immediates appear once).
+        sites_per_value: dict[int, set] = {}
+        for csite, value in entry["cmp"]:
+            sites_per_value.setdefault(value, set()).add(csite)
+        below = {v: len(s) for v, s in sites_per_value.items() if 0 < v < debug_const}
+        body_cmps = body_cmp_constants(elf, target)
+
+        if below:
+            advanced = max(below.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            source = f"callers ({below[advanced]}/{len(entry['cmp'])} sites)"
+        else:
+            wanted = [v for v in body_cmps if v < debug_const] or body_cmps
+            if not wanted:
+                continue
+            advanced, source = max(wanted), "body"
+        if advanced <= 0 or advanced >= debug_const:
+            continue
+
+        score = 3 * len(below) + len(body_cmps) + len(entry["setg"])
+        site, _imm, region = entry["sete"][0]
+        any_site, any_len = entry["setg"][0]
+        scored.append((score, target, {
+            "tier_fn": target,
+            "advanced": advanced,
+            "debug_const": debug_const,
+            "debug_site": site,
+            "debug_len": region,
+            "any_site": any_site,
+            "any_len": any_len,
+            "compared": sorted(sites_per_value),
+            "body_cmps": body_cmps,
+            "call_sites": len(entry["sete"]) + len(entry["setg"]),
+            "source": source,
+            "patched": False,
+            "partially_patched": False,
+        }))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][2]
+
+
+def find_gate_patched(elf: Elf, index) -> dict | None:
+    """Recover the gate from a library this script already patched.
+
+    The wrapper tails are overwritten, but both the tier function entry
+    (`mov eax,<v>; ret`) and the callers' comparisons survive.
+    """
+    for target, entry in index.items():
+        head = elf.at(target, 6)
+        if len(head) != 6 or head[0] != 0xB8 or head[5] != 0xC3:
+            continue
+        value = struct.unpack_from("<I", head, 1)[0]
+        if not 0 < value < 0x10000:
+            continue
+        matching = sorted({csite for csite, value2 in entry["cmp"] if value2 == value})
+        if len(matching) >= 2:  # the game's own callers still compare against it
+            return {
+                "tier_fn": target,
+                "advanced": value,
+                "debug_const": None,
+                "debug_site": None,
+                "debug_len": 0,
+                "any_site": None,
+                "any_len": 0,
+                "compared": sorted({v for _s, v in entry["cmp"]}),
+                "body_cmps": [],
+                "call_sites": len(matching),
+                "source": "recovered",
+                "patched": True,
+                "partially_patched": False,
+            }
+    return None
+
+
+def analyse(elf: Elf) -> dict | None:
+    index = build_call_index(elf)
+    gate = find_gate_fresh(elf, index)
+    if gate is None:
+        return find_gate_patched(elf, index)
+
+    advanced = gate["advanced"]
+    tier_ok = elf.at(gate["tier_fn"], 6) == patch_mov_eax(advanced)
+    tail_ok = elf.at(gate["debug_site"], gate["debug_len"]) == patch_true(gate["debug_len"])
+    entry_ok = any(
+        elf.at(gate["debug_site"] - back, 6) == b"\xb8\x01\x00\x00\x00\xc3"
+        for back in range(0, 0xA0)
+    )
+    debug_ok = tail_ok or entry_ok
+    gate["patched"] = tier_ok and debug_ok
+    gate["partially_patched"] = tier_ok != debug_ok
+    return gate
+
+
+# ------------------------------------------------------------------- patch bytes
+def patch_mov_eax(value: int) -> bytes:
+    return struct.pack("<BI", 0xB8, value) + b"\xc3"
+
+
+def patch_true(region_len: int) -> bytes:
+    return struct.pack("<BI", 0xB8, 1) + b"\x90" * (region_len - 5)
+
+
+def apply_patch(elf: Elf, gate: dict) -> list[str]:
+    log = []
+    for label, addr, payload in (
+        (f"GetCheatTier                   (returns advanced={gate['advanced']})", gate["tier_fn"], patch_mov_eax(gate["advanced"])),
+        (f"DebugEnabled wrapper tail     (forced true)", gate["debug_site"], patch_true(gate["debug_len"])),
+        (f"AnyCheatsEnabled wrapper tail (forced true)", gate["any_site"], patch_true(gate["any_len"])),
+    ):
+        off = elf.v2o(addr)
+        log.append(f"{label}  vaddr {addr:#x}  file offset {off:#x}  <- {payload.hex(' ')}")
+        elf.write(addr, payload)
+    return log
+
+
+# ------------------------------------------------------------------------- install
+def looks_like_il2cpp_game(d: Path) -> bool:
+    if not (d / "GameAssembly.so").is_file():
+        return False
+    for data in d.glob("*_Data"):
+        if (data / "il2cpp_data/Metadata/global-metadata.dat").is_file():
+            return True
+    return False
+
+
+def find_game_dir(explicit: str | None) -> Path:
+    if explicit:
+        d = Path(explicit).expanduser().resolve()
+        if not looks_like_il2cpp_game(d):
+            raise SystemExit(f"{d} does not look like a Unity IL2CPP game folder")
+        return d
+    candidates: list[Path] = []
+    for root in SEARCH_ROOTS:
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            dirs = [entry] + ([p for p in entry.iterdir() if p.is_dir()] if entry.is_dir() else [])
+            candidates += [d for d in dirs if looks_like_il2cpp_game(d)]
+    if not candidates:
+        raise SystemExit(
+            "Could not find the game. Pass --game-dir /path/to/game (the folder with GameAssembly.so)."
+        )
+    hinted = [c for c in candidates if any(h in str(c).lower() for h in GAME_HINTS)]
+    return (hinted or candidates)[0]
+
+
+def game_version(game_dir: Path) -> str:
+    receipt = game_dir / ".itch/receipt.json.gz"
+    if receipt.is_file():
+        try:
+            with gzip.open(receipt) as fh:
+                build = ((json.load(fh).get("upload") or {}).get("build") or {})
+            if build.get("userVersion"):
+                return str(build["userVersion"])
+        except Exception:
+            pass
+    for marker in ("version.txt", "VERSION"):
+        f = game_dir / marker
+        if f.is_file():
+            return f.read_text(errors="replace").strip().splitlines()[0][:32]
+    return "unknown"
+
+
+def game_running(game_dir: Path) -> list[str]:
+    hits = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or not (proc / "cmdline").is_file():
+            continue
+        try:
+            cmd = (proc / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "mdrg-cheats" in cmd:
+            continue
+        if str(game_dir) in cmd and (".x86_64" in cmd or "Dystopian" in cmd):
+            hits.append(f"pid {proc.name}: {cmd.strip()[:90]}")
+    return hits
+
+
+def disasm(path: Path, vaddr: int, nbytes: int) -> str | None:
+    if not which("objdump"):
+        return None
+    try:
+        out = subprocess.run(
+            ["objdump", "-d", f"--start-address={vaddr}", f"--stop-address={vaddr + nbytes}",
+             "-M", "intel", str(path)],
+            capture_output=True, text=True, timeout=180).stdout
+    except Exception:
+        return None
+    lines = [ln for ln in out.splitlines() if ":\t" in ln]
+    return "\n".join("    " + ln.split(":", 1)[1].strip() for ln in lines) or None
+
+
+# ------------------------------------------------------------------------------ main
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Enable cheats in any My Dystopian Robot Girlfriend version.")
+    ap.add_argument("--game-dir", help="game folder containing GameAssembly.so")
+    ap.add_argument("--status", action="store_true", help="report state, change nothing")
+    ap.add_argument("--dry-run", action="store_true", help="show patches, change nothing")
+    ap.add_argument("--revert", action="store_true", help="restore the pristine library")
+    ap.add_argument("--force", action="store_true", help="proceed even if the game is running")
+    args = ap.parse_args()
+
+    game_dir = find_game_dir(args.game_dir)
+    so_path = game_dir / "GameAssembly.so"
+    version = game_version(game_dir)
+    SHARE.mkdir(parents=True, exist_ok=True)
+    backup = SHARE / f"GameAssembly.so.{version}.orig"
+
+    print(f"game     : {game_dir}")
+    print(f"version  : {version}")
+    print(f"library  : {so_path}  ({so_path.stat().st_size:,} bytes, sha256 {sha256(so_path.read_bytes()).hexdigest()[:16]})")
+    print(f"backups  : {SHARE}")
+
+    if args.revert:
+        if not backup.is_file():
+            print(f"!! no pristine backup for version {version} in {SHARE}", file=sys.stderr)
+            for b in sorted(SHARE.glob("GameAssembly.so*.orig")):
+                print(f"   available: {b.name}", file=sys.stderr)
+            return 1
+        running = game_running(game_dir)
+        if running and not args.force:
+            print("!! the game is running - close it first:", *running, sep="\n   ", file=sys.stderr)
+            return 1
+        so_path.write_bytes(backup.read_bytes())
+        print(f"restored : {backup.name} -> GameAssembly.so")
+        print("state    : cheats disabled (pristine).")
+        return 0
+
+    elf = Elf(so_path)
+    gate = analyse(elf)
+    if gate is None:
+        print(
+            "\n!! could not locate Options.GetCheatTier structurally.\n"
+            "   This build's cheat system no longer matches the known shape, or the library\n"
+            "   is damaged/half-patched. Nothing was written.\n"
+            "   Recovery: restore from backup (mdrg-cheats --revert) or verify the game install,\n"
+            "   then dump it with Il2CppDumper and patch Options.GetCheatTier() by name.",
+            file=sys.stderr,
+        )
+        return 1
+
+    off = elf.v2o(gate["tier_fn"])
+    print(f"gate     : GetCheatTier @ vaddr {gate['tier_fn']:#x} (file offset {off:#x})")
+    if gate["source"] == "recovered":
+        print(f"tier     : advanced={gate['advanced']} (recovered from callers: {gate['compared']})")
+    else:
+        print(f"tier     : caller compares {gate['compared']} -> advanced={gate['advanced']} debug={gate['debug_const']} (source: {gate['source']})")
+        print(f"wrappers : DebugEnabled@{gate['debug_site']:#x}({gate['debug_len']})  AnyCheatsEnabled@{gate['any_site']:#x}({gate['any_len']})")
+
+    if gate["patched"]:
+        print("\nstate    : ALREADY PATCHED - nothing to do.")
+        return 0
+
+    plan = apply_patch(elf, gate)
+    print("\npatches:")
+    for line in plan:
+        print("  - " + line)
+
+    if args.status or args.dry_run:
+        print(f"\n({'status' if args.status else 'dry run'}) nothing written.")
+        return 0
+
+    running = game_running(game_dir)
+    if running and not args.force:
+        print("\n!! the game is running - close it and re-run (or pass --force):", file=sys.stderr)
+        for line in running:
+            print("   " + line, file=sys.stderr)
+        return 1
+
+    if backup.is_file():
+        print(f"\nbackup   : {backup.name} (already present for this version, kept)")
+    else:
+        backup.write_bytes(elf.data)
+        print(f"\nbackup   : {backup}")
+
+    so_path.write_bytes(elf.render())
+
+    check = Elf(so_path)
+    ok = check.at(gate["tier_fn"], 6) == patch_mov_eax(gate["advanced"])
+    print(f"written  : GameAssembly.so ({'verified' if ok else 'VERIFY FAILED'})")
+    print(f"sha256   : {sha256(so_path.read_bytes()).hexdigest()}")
+    snip = disasm(so_path, gate["tier_fn"], 12)
+    if snip:
+        print("after    :")
+        print(snip)
+    print("\nunlocked : money, church reset, cum cheats, add any item, colour/quality changes, fish weight, + debug features.")
+    print("undo     : mdrg-cheats --revert")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
